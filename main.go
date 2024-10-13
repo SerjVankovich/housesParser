@@ -1,21 +1,25 @@
 package main
 
 import (
+	"bufio"
 	"encoding/json"
 	"fmt"
-	osrm "github.com/gojuno/go.osrm"
-	geo "github.com/paulmach/go.geo"
-	"github.com/paulmach/osm"
-	"github.com/twpayne/go-geom"
-	"golang.org/x/net/context"
 	"houseParser/utils"
 	"io"
 	"log"
 	"math"
 	"os"
+	"slices"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
+
+	osrm "github.com/gojuno/go.osrm"
+	geo "github.com/paulmach/go.geo"
+	"github.com/paulmach/osm"
+	"github.com/twpayne/go-geom"
+	"golang.org/x/net/context"
 	//osrm "github.com/gojuno/go.osrm"
 	//geo "github.com/paulmach/go.geo"
 )
@@ -38,7 +42,7 @@ const THEATRE = "theatre"
 const MUSEUM = "museum"
 
 const AREA_PER_PERSON = 18
-const AREA_PER_PUPIL = 7.5
+const AREA_PER_PUPIL = 7.6
 const AREA_PER_CHILD = 8
 const AREA_PER_OFFICE_EMPLOYEE = 4.5
 const AREA_PER_INDUSTRIAL_EMPLOYEE = 10
@@ -128,47 +132,444 @@ func main() {
 	//f.Write(p)
 	//FindNearestCrossroads()
 	//MergeCrossroads()
-	PlayCrossroads()
+	//PlayCrossroads()
+	//BuildDistancesAndLinesMatrix()
+	b := 0.065
+	eps := 0.001
+	T := iterativeGravityModel(b, eps)
+	SaveFloat64Matrix("correspondence2.txt", T)
+}
+
+func BuildCorrespondenceMatrix() {
+	var crossroads []*CrossRoad
+	LoadJson("weightedCrossroads.json", &crossroads)
+	n := len(crossroads)
+
+	distances := LoadDistances()
+
+	corrMatrix := make([][]float64, n)
+	for i := range corrMatrix {
+		corrMatrix[i] = make([]float64, n)
+	}
+	for k := range 10 {
+		print(k)
+		Q_is, R_js := GetQ_is_R_js(crossroads, corrMatrix)
+		CorrectMatrix(corrMatrix, crossroads)
+		for i := range n {
+			for j := range n {
+				Q_i := Q_is[i]
+				R_j := R_js[j]
+
+				f_ij := DistFunc(distances[i][j])
+				if Q_i != 0 && R_j != 0 && f_ij != 0 {
+					corrMatrix[i][j] = corrMatrix[i][j] + Q_i*R_j*f_ij/SumRowApplied(distances[i], R_js, j)
+				}
+			}
+		}
+	}
+
+	var nonEmpty []float64
+	for _, row := range corrMatrix {
+		for _, val := range row {
+			if val != 0 {
+				nonEmpty = append(nonEmpty, val)
+			}
+		}
+	}
+	println(len(nonEmpty))
+	max := 0.0
+	min := 100000.0
+	sum := 0.0
+	for _, val := range nonEmpty {
+		if val > max {
+			max = val
+		}
+		if val < min {
+			min = val
+		}
+		sum += val
+	}
+
+	fmt.Printf("%10.f\n", max)
+	println(min)
+	fmt.Printf("%10.f\n", sum)
+
+	SaveFloat64Matrix("correspondence.txt", corrMatrix)
+
+}
+
+// Итерационный алгоритм
+func iterativeGravityModel(b float64, epsilon float64) [][]float64 {
+
+	var crossroads []*CrossRoad
+	LoadJson("weightedCrossroads.json", &crossroads)
+
+	var d [][]float64 = LoadDistances()
+	n := len(crossroads)
+	T := make([][]float64, n)
+	for i := range T {
+		T[i] = make([]float64, n)
+	}
+	A := make([]float64, n)
+	B := make([]float64, n)
+	for k := range A {
+		A[k] = 1.0
+		B[k] = 1.0
+	}
+	iteration := 0
+	// Итерационный процесс
+	for {
+		println(iteration)
+		previousT := make([][]float64, n)
+		for i := range previousT {
+			previousT[i] = make([]float64, n)
+			copy(previousT[i], T[i])
+		}
+		// Обновление A[i]
+		for i := range A {
+			sum := 0.0
+			for j := range B {
+				if i != j {
+					sum += B[j] * crossroads[j].InWeight * DistFunc(d[i][j])
+				}
+			}
+			if sum != 0 && math.Round(sum*1e20) != 0 {
+				A[i] = 1.0 / sum
+			}
+		}
+		// Обновление B[j]
+		for j := range B {
+			sum := 0.0
+			for i := range A {
+				if i != j {
+					x := A[i] * crossroads[i].OutWeight * DistFunc(d[i][j])
+					sum += x
+				}
+			}
+			if sum != 0 && math.Round(sum*1e20) != 0 {
+				B[j] = 1.0 / sum
+			}
+		}
+		// Обновление матрицы T[i][j]
+		for i := range T {
+			for j := range T[i] {
+				if i != j {
+					T[i][j] = A[i] * crossroads[i].OutWeight * B[j] * crossroads[j].InWeight * DistFunc(d[i][j])
+				} else {
+					T[i][j] = 0
+				}
+			}
+		}
+		// Проверка сходимости
+		converged := true
+		for i := range T {
+			for j := range T[i] {
+				if T[i][j] != 0 && math.Abs(T[i][j]-previousT[i][j])/T[i][j] > epsilon {
+					converged = false
+					break
+				}
+			}
+			if !converged {
+				break
+			}
+		}
+		if converged || iteration > 500 {
+			break
+		}
+		iteration += 1
+	}
+	return T
+}
+
+func GetQ_is_R_js(crossroads []*CrossRoad, corrMatrix [][]float64) ([]float64, []float64) {
+	var Q_is []float64
+	var R_js []float64
+	for i, crossroad := range crossroads {
+		Q_is = append(Q_is, crossroad.OutWeight-SumRow(corrMatrix, i))
+		R_js = append(R_js, crossroad.InWeight-SumCol(corrMatrix, i))
+	}
+
+	return Q_is, R_js
+}
+
+func CorrectMatrix(corrMatrix [][]float64, crossroads []*CrossRoad) {
+	n := len(crossroads)
+	for i := range n {
+		for j := range n {
+			D_j := crossroads[j].InWeight
+			if D_j != 0 {
+				sumCol := SumCol(corrMatrix, j)
+				if sumCol > D_j {
+					corrMatrix[i][j] = corrMatrix[i][j] * D_j / sumCol
+				}
+			}
+		}
+	}
+}
+
+func SumCol(corrMatrix [][]float64, j int) float64 {
+	sum := 0.0
+	for _, row := range corrMatrix {
+		sum += row[j]
+	}
+	return sum
+}
+
+func SumRow(corrMatrix [][]float64, i int) float64 {
+	sum := 0.0
+	for _, col := range corrMatrix[i] {
+		sum += col
+	}
+	return sum
+}
+
+func SumRowApplied(distances []float64, R_js []float64, j int) float64 {
+	sum := 0.0
+	for _, distance := range distances {
+		sum += R_js[j] * DistFunc(distance)
+	}
+	return sum
+}
+
+func DistFunc(c_ij float64) float64 {
+	const beta = 0.065
+	return math.Exp(-beta * c_ij)
+}
+
+func LoadDistances() [][]float64 {
+	file, err := os.Open("distances.txt")
+	utils.ProcessError(err)
+	defer file.Close()
+
+	scanner := bufio.NewScanner(file)
+	var distances [][]float64
+	// optionally, resize scanner's capacity for lines over 64K, see next example
+	for scanner.Scan() {
+		line := scanner.Text()
+		if line != "" {
+			var distanceLine []float64
+			strDists := strings.Split(line, " ")
+			for _, dist := range strDists {
+				floatDist, _ := strconv.ParseFloat(dist, 32)
+				distanceLine = append(distanceLine, floatDist)
+			}
+			distances = append(distances, distanceLine)
+		}
+	}
+
+	if err := scanner.Err(); err != nil {
+		log.Fatal(err)
+	}
+
+	return distances
+}
+
+func BuildDistancesAndLinesMatrix() {
+	var crossroads []*CrossRoad
+	LoadJson("weightedCrossroads.json", &crossroads)
+	wg := sync.WaitGroup{}
+	n := len(crossroads)
+	nContainers := 10
+
+	var distances = make([][]float32, n)
+	for i := range distances {
+		distances[i] = make([]float32, n)
+	}
+	var lines = make([][]string, n)
+	for i := range lines {
+		lines[i] = make([]string, n)
+
+	}
+	step := n / 10
+	start := 0
+	stop := step
+	for i := range nContainers {
+		wg.Add(1)
+		go func(start, stop, i int) {
+			defer wg.Done()
+			FillSubMatrix(start, stop, i, crossroads, distances, lines)
+		}(start, stop, i)
+		start = stop
+		stop += step
+	}
+	wg.Wait()
+	for _, distance := range distances {
+		fmt.Println(distance[:10])
+	}
+
+	SaveFloatMatrix("distances.txt", distances)
+	SaveLines(lines)
+}
+
+func FillSubMatrix(start int, stop int, batchNum int, crossroads []*CrossRoad, distances [][]float32, lines [][]string) {
+	port := strconv.Itoa(5000 + batchNum + 1)
+	if batchNum == 9 {
+		stop = len(crossroads)
+	}
+	for i, crossroad1 := range crossroads[start:stop] {
+		fmt.Println(port + ">" + strconv.Itoa(i) + " start: " + strconv.Itoa(start) + " stop: " + strconv.Itoa(stop))
+		for j, crossroad2 := range crossroads {
+			distance, line := FetchDistance(crossroad1, crossroad2, port)
+			distances[start+i][j] = distance
+			lines[start+i][j] = line
+		}
+	}
+}
+
+func SaveLines(lines [][]string) {
+	f, err := os.Create("lines.txt")
+
+	utils.ProcessError(err)
+
+	defer f.Close()
+	for _, linesArr := range lines {
+		linesStr := strings.Join(linesArr, " ")
+		_, err = f.WriteString(linesStr + "\n")
+		utils.ProcessError(err)
+	}
+	fmt.Println("done")
+}
+
+func SaveFloatMatrix(file string, distances [][]float32) {
+	f, err := os.Create(file)
+
+	utils.ProcessError(err)
+
+	defer f.Close()
+	for _, distanceArr := range distances {
+		distancesStr := strings.Trim(fmt.Sprint(distanceArr), "[]")
+		_, err = f.WriteString(distancesStr + "\n")
+		utils.ProcessError(err)
+	}
+	fmt.Println("done")
+}
+
+func SaveFloat64Matrix(file string, distances [][]float64) {
+	f, err := os.Create(file)
+
+	utils.ProcessError(err)
+
+	defer f.Close()
+	for _, distanceArr := range distances {
+		distancesStr := strings.Trim(fmt.Sprint(distanceArr), "[]")
+		_, err = f.WriteString(distancesStr + "\n")
+		utils.ProcessError(err)
+	}
+	fmt.Println("done")
+}
+
+func FetchDistance(crossroad1 *CrossRoad, crossroad2 *CrossRoad, port string) (float32, string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Second)
+	defer cancel()
+	client := osrm.NewFromURLWithTimeout("http://172.28.239.75:"+port, 100*time.Second)
+	response, err := client.Route(ctx, osrm.RouteRequest{
+		Profile: "car",
+		Coordinates: osrm.NewGeometryFromPointSet(geo.PointSet{
+			{crossroad1.Node.Lon, crossroad1.Node.Lat},
+			{crossroad2.Node.Lon, crossroad2.Node.Lat},
+		}),
+		Steps:       osrm.StepsTrue,
+		Annotations: osrm.AnnotationsTrue,
+		Geometries:  osrm.GeometriesPolyline6,
+	})
+	utils.ProcessError(err)
+	return response.Routes[0].Distance, getLine(response.Routes[0])
+}
+
+func getLine(route osrm.Route) string {
+	legs := route.Legs
+	var points geo.PointSet
+	for _, leg := range legs {
+		for _, step := range leg.Steps {
+			points = slices.Concat(points, step.Geometry.PointSet)
+		}
+	}
+
+	geometry := &osrm.Geometry{Path: geo.Path{PointSet: points}}
+	return geometry.Polyline()
+}
+
+func findDistance(crossroad1 CrossRoad, crossroad2 CrossRoad, i int, j int, n int, distances [][]float64, lines [][]string) {
+	if i == j {
+		distances[i][j] = 0
+		return
+	}
+	if crossroad1.OutWeight == 0 || crossroad2.InWeight == 0 {
+		distances[i][j] = 0
+	}
 }
 
 func PlayCrossroads() {
 
-	var wg sync.WaitGroup
+	//var wg sync.WaitGroup
 	var crossroads []*CrossRoad
 	LoadJson("weightedCrossroads.json", &crossroads)
+	firstCrossroad := crossroads[0]
+	secondCrossroad := crossroads[1]
 
-	for i, crossroad := range crossroads {
-		time.Sleep(1000 * time.Millisecond)
-		for _, crossroad1 := range crossroads {
-			i := i
-			crossroad := crossroad
+	println(firstCrossroad.Node.Lon, secondCrossroad.Node.Lat)
+	println()
 
-			wg.Add(1)
-			time.Sleep(10 * time.Millisecond)
-
-			crossroad1 := crossroad1
-			go func() {
-				ctx, cancel := context.WithTimeout(context.Background(), 10000*time.Second)
-				defer cancel()
-				defer wg.Done()
-				client := osrm.NewFromURLWithTimeout("http://0.0.0.0:5000", 10000*time.Second)
-				_, err := client.Route(ctx, osrm.RouteRequest{
-					Profile: "car",
-					Coordinates: osrm.NewGeometryFromPointSet(geo.PointSet{
-						{crossroad1.Node.Lon, crossroad1.Node.Lat},
-						{crossroad.Node.Lon, crossroad.Node.Lat},
-					}),
-					Steps:       osrm.StepsFalse,
-					Annotations: osrm.AnnotationsTrue,
-					Overview:    osrm.OverviewFalse,
-					Geometries:  osrm.GeometriesPolyline6,
-				})
-				utils.ProcessError(err)
-				log.Printf("routes are: %d", i)
-			}()
-		}
+	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+	defer cancel()
+	client := osrm.NewFromURLWithTimeout("http://172.28.239.75:5001", 1*time.Second)
+	request := osrm.RouteRequest{
+		Profile: "car",
+		Coordinates: osrm.NewGeometryFromPointSet(geo.PointSet{
+			{firstCrossroad.Node.Lon, firstCrossroad.Node.Lat},
+			{secondCrossroad.Node.Lon, secondCrossroad.Node.Lat},
+		}),
+		Steps:       osrm.StepsTrue,
+		Annotations: osrm.AnnotationsTrue,
+		Geometries:  osrm.GeometriesPolyline6,
 	}
-	wg.Wait()
+	route, err := client.Route(ctx, request)
+	utils.ProcessError(err)
+	legs := route.Routes[0].Legs
+	for i, leg := range legs {
+		println("LEG: ", i)
+		var points geo.PointSet
+		for _, step := range leg.Steps {
+			points = slices.Concat(points, step.Geometry.PointSet)
+		}
+		geometry := &osrm.Geometry{Path: geo.Path{PointSet: points}}
+		println(geometry.Polyline())
+
+	}
+	log.Printf("routes are: %+v", route.Routes[0])
+
+	//for i, crossroad := range crossroads {
+	//	time.Sleep(1000 * time.Millisecond)
+	//	for _, crossroad1 := range crossroads {
+	//		i := i
+	//		crossroad := crossroad
+	//
+	//		wg.Add(1)
+	//		time.Sleep(10 * time.Millisecond)
+	//
+	//		crossroad1 := crossroad1
+	//		go func() {
+	//			ctx, cancel := context.WithTimeout(context.Background(), 10000*time.Second)
+	//			defer cancel()
+	//			defer wg.Done()
+	//			client := osrm.NewFromURLWithTimeout("http://0.0.0.0:5000", 10000*time.Second)
+	//			_, err := client.Route(ctx, osrm.RouteRequest{
+	//				Profile: "car",
+	//				Coordinates: osrm.NewGeometryFromPointSet(geo.PointSet{
+	//					{crossroad1.Node.Lon, crossroad1.Node.Lat},
+	//					{crossroad.Node.Lon, crossroad.Node.Lat},
+	//				}),
+	//				Steps:       osrm.StepsFalse,
+	//				Annotations: osrm.AnnotationsTrue,
+	//				Overview:    osrm.OverviewFalse,
+	//				Geometries:  osrm.GeometriesPolyline6,
+	//			})
+	//			utils.ProcessError(err)
+	//			log.Printf("routes are: %d", i)
+	//		}()
+	//	}
+	//}
+	//wg.Wait()
 
 }
 
@@ -249,17 +650,6 @@ func MergeCrossroads() {
 	println(len(leftCrossroads))
 
 	MarshallToJsonAndSave(leftCrossroads, "weightedCrossroads.json")
-
-	//sort.Slice(distances, func(i, j int) bool {
-	//	return distances[i].Distance < distances[j].Distance
-	//})
-	//
-	//println(firstCrossroad.Node.ID)
-	//
-	//for _, distance := range distances {
-	//	fmt.Printf("Distance: %2f %2f\n", float64(distance.Id), distance.Distance)
-	//}
-
 }
 
 func MarshallToJsonAndSave(leftCrossroads interface{}, filename string) {
@@ -555,9 +945,6 @@ func LoadCrossRoads(mapData *osm.OSM) {
 			for _, node := range way.Nodes {
 				crossroad, contains := crossroads[node.ID]
 				street := way.Tags.Find("name")
-				if node.ID == 392987863 {
-					fmt.Println(street)
-				}
 
 				if contains {
 					if crossroad.Street != street {

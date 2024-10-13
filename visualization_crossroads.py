@@ -1,6 +1,7 @@
 import folium
 import json
 import math
+import polyline
 
 AREA_PER_PERSON = 18
 AREA_PER_PUPIL = 7.5
@@ -31,6 +32,11 @@ HOSPITAL = "hospital"
 THEATRE = "theatre"
 MUSEUM = "museum"
 
+way = "sk_xJql}pEjB|EbBlEHR??bA_C|@wAV[rBiC~CyDrB}ChAmBvAmCFON]vAoDXoAXsAb@mC|@yEp@yBb@}A`AeEP_ATu@Rc@Vc@t@kAZ[|B}Bb@w@p@}A`AwCn@eBt@oAl@}@xAqCr@aBZ}@h@iBPo@@GVkAZyAFYp@mFHiBPaFFwBLgB??`A|@bMzLv@jARj@hFrNbZ|w@nGtOrAvE??jBzAxAw@??Z{D??jBc@|IcANC`Ii@nHG??Jd@b@lBr@lAb@fB??{@bFWxBi@zCuBxM??"
+coords = polyline.decode(way)
+
+print(coords)
+
 
 def create_map():
     print("Creating map")
@@ -40,7 +46,10 @@ def create_map():
     pop = 0
     no_liv_pop = 0
     for crossroad in data:
-        population = calculate_living_population(crossroad["buildings"])
+        population = calculate_non_liv_pop(crossroad["buildings"])
+
+        folium.PolyLine(locations=coords, weight=2,
+                        color='red').add_to(map)
 
         folium.CircleMarker(location = (crossroad["Node"]["lat"], crossroad["Node"]["lon"]),
                                  fill_opacity = 0.6, 
@@ -58,9 +67,8 @@ def create_map():
                                  fill_opacity = 0.6, 
                                  radius = b_pop // 100,
                                  popup= "Population " + str(b_pop)).add_to(map)
-        print(population, crossroad["Node"])
-        pop += population
-    print(pop)
+        no_liv_pop += population
+    print(no_liv_pop)
 
     # f = open("buildings.json", encoding="utf8")
     # buildings = json.load(f)
@@ -80,8 +88,8 @@ def create_map():
 def calculate_living_population(buildings):
     population = 0
     for building in buildings:
-        if building["type"] == "house":
-            population += building["area"]*0.5 / 18
+        if building["type"] == HOUSE:
+            population += calculate_pop_in_building(building)
     return math.ceil(population)
 
 def calculate_non_liv_pop(buildings):
